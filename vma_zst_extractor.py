@@ -131,31 +131,21 @@ class VMAExtractor:
         return file_path.suffix.lower() in ['.zst', '.zstd']
     
     def decompress_zst(self, zst_file: Path) -> Optional[Path]:
-        """
-        Распаковка .vma.zst файла во временный .vma файл
-        
-        Returns:
-            Path: путь к распакованному .vma файлу
-        """
-        # Создаем временную директорию
+        """Распаковка .vma.zst файла"""
         if not self.temp_dir:
             self.temp_dir = Path(tempfile.mkdtemp(prefix='vma_temp_'))
-            self.logger.debug(f"Создана временная директория: {self.temp_dir}")
         
-        # Путь для распакованного файла
         vma_name = zst_file.name
         if vma_name.lower().endswith('.zst'):
-            vma_name = vma_name[:-4]  # убираем .zst
+            vma_name = vma_name[:-4]
         elif vma_name.lower().endswith('.zstd'):
-            vma_name = vma_name[:-5]  # убираем .zstd
-        
+            vma_name = vma_name[:-5]
         temp_vma = self.temp_dir / vma_name
-        
+
         self.logger.info(f"📦 Распаковка ZST: {zst_file.name}")
-        self.logger.info(f"   Размер сжатого файла: {self.format_size(zst_file.stat().st_size)}")
         
-        # Команда распаковки (как вы указали)
-        cmd = f"{self.zstd_path} -d {zst_file} -o {temp_vma} --force"
+        # Правильная команда для вашей версии zstd
+        cmd = f"{self.zstd_path} {zst_file} -o {temp_vma}"
         
         try:
             process = subprocess.Popen(
@@ -168,7 +158,6 @@ class VMAExtractor:
                 universal_newlines=True
             )
             
-            # Читаем вывод
             while True:
                 output = process.stderr.readline()
                 if output == '' and process.poll() is not None:
@@ -180,7 +169,7 @@ class VMAExtractor:
             
             if process.returncode == 0 and temp_vma.exists():
                 self.logger.info(f"✅ Распакован: {temp_vma.name}")
-                self.logger.info(f"   Размер распакованного файла: {self.format_size(temp_vma.stat().st_size)}")
+                self.logger.info(f"   Размер: {self.format_size(temp_vma.stat().st_size)}")
                 return temp_vma
             else:
                 self.logger.error(f"❌ Ошибка распаковки ZST: {stderr}")
