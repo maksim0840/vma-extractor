@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Скрипт для пакетной распаковки VMA/VMA.ZST файлов
-Работает с утилитами zstd и vma
-Временные файлы создаются в output директории
+Распаковывает .vma.zst напрямую через pipe без промежуточных файлов
 """
 
 import os
@@ -14,14 +13,12 @@ from pathlib import Path
 from datetime import datetime
 import argparse
 import logging
-import tempfile
 from typing import List, Tuple, Optional
 
 class VMAExtractor:
     def __init__(self, input_dir: str, output_dir: str, 
                  vma_path: str = "./vma", 
                  zstd_path: str = "/usr/bin/zstd",
-                 keep_temp: bool = False,
                  log_file: str = None):
         """
         Инициализация экстрактора VMA.ZST файлов
@@ -29,18 +26,15 @@ class VMAExtractor:
         Args:
             input_dir: Путь к директории с VMA.ZST файлами
             output_dir: Путь к директории для результатов
-            vma_path: Путь к утилите vma (по умолчанию ./vma)
-            zstd_path: Путь к утилите zstd (по умолчанию /usr/bin/zstd)
-            keep_temp: Сохранять временные .vma файлы
+            vma_path: Путь к утилите vma
+            zstd_path: Путь к утилите zstd
             log_file: Путь к файлу лога
         """
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
         self.vma_path = vma_path
         self.zstd_path = zstd_path
-        self.keep_temp = keep_temp
         self.log_file = log_file
-        self.temp_dir = None
         
         # Настройка логирования
         self.setup_logging()
@@ -139,63 +133,12 @@ class VMAExtractor:
         """Проверка, является ли файл сжатым ZST"""
         return file_path.suffix.lower() in ['.zst', '.zstd']
     
-    def decompress_zst(self, zst_file: Path, output_dir: Path) -> Optional[Path]:
+    def extract_vma_zst(self, zst_file: Path, output_dir: Path) -> bool:
         """
-        Распаковка .vma.zst файла в output директорию
+        Распаковка .vma.zst напрямую через pipe в vma extract
         
         Args:
             zst_file: Путь к .vma.zst файлу
-            output_dir: Директория для распакованного .vma файла
-            
-        Returns:
-            Path: путь к распакованному .vma файлу или None в случае ошибки
-        """
-        # Получаем имя файла без расширения .zst
-        vma_name = zst_file.name
-        if vma_name.lower().endswith('.zst'):
-            vma_name = vma_name[:-4]
-        elif vma_name.lower().endswith('.zstd'):
-            vma_name = vma_name[:-5]
-        
-        # Создаем путь для распакованного файла в output директории
-        temp_vma = output_dir / f".{vma_name}.tmp"  # Временный файл с точкой в начале
-        
-        self.logger.info(f"📦 Распаковка ZST: {zst_file.name}")
-        self.logger.info(f"   Размер сжатого файла: {self.format_size(zst_file.stat().st_size)}")
-        self.logger.info(f"   Временный файл: {temp_vma}")
-        
-        # Формируем команду как список (без shell=True)
-        cmd = [self.zstd_path, str(zst_file), "-o", str(temp_vma)]
-        
-        self.logger.debug(f"Выполняю команду: {' '.join(cmd)}")
-        
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if result.returncode == 0 and temp_vma.exists():
-                self.logger.info(f"✅ Распакован: {temp_vma.name}")
-                self.logger.info(f"   Размер распакованного файла: {self.format_size(temp_vma.stat().st_size)}")
-                return temp_vma
-            else:
-                self.logger.error(f"❌ Ошибка распаковки ZST")
-                self.logger.error(f"   Команда: {' '.join(cmd)}")
-                self.logger.error(f"   Код возврата: {result.returncode}")
-                if result.stdout:
-                    self.logger.error(f"   STDOUT: {result.stdout}")
-                if result.stderr:
-                    self.logger.error(f"   STDERR: {result.stderr}")
-                return None
-                
-        except Exception as e:
-            self.logger.error(f"❌ Исключение при распаковке ZST: {e}")
-            return None
-    
-    def extract_vma(self, vma_file: Path, output_dir: Path) -> bool:
-        """
-        Распаковка VMA файла
-        
-        Args:
-            vma_file: Путь к .vma файлу
             output_dir: Директория для вывода (не должна существовать)
             
         Returns:
@@ -212,78 +155,119 @@ class VMAExtractor:
                 self.logger.info(f"   ⏭️  Пропуск")
                 return False
         
-        # Формируем команду как список
+        self.logger.info(f"🔄 Распаковка ZST -> VMA (pipe): {zst_file.name}")
+        
+        # Команда для zstd (распаковка в stdout)
+        zstd_cmd = [self.zstd_path, "-dc", str(zst_file)]
+        
+        # Команда для vma (чтение из stdin)
+        vma_cmd = [self.vma_path, "extract", "-v", "-", str(output_dir)]
+        
+        self.logger.debug(f"Выполняю: {' '.join(zstd_cmd)} | {' '.join(vma_cmd)}")
+        
+        try:
+            # Запускаем zstd
+            zstd_process = subprocess.Popen(
+                zstd_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            
+            # Запускаем vma, передавая stdout от zstd
+            vma_process = subprocess.Popen(
+                vma_cmd,
+                stdin=zstd_process.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            
+            # Закрываем stdout zstd в родительском процессе
+            zstd_process.stdout.close()
+            
+            # Получаем вывод от vma
+            vma_stdout, vma_stderr = vma_process.communicate()
+            
+            # Ждем завершения zstd
+            zstd_stderr = zstd_process.stderr.read()
+            zstd_process.wait()
+            
+            # Проверяем результаты
+            if vma_process.returncode == 0:
+                self.logger.info(f"✅ Успешно распакован: {zst_file.name}")
+                return True
+            else:
+                self.logger.error(f"❌ Ошибка распаковки")
+                self.logger.error(f"   VMA returncode: {vma_process.returncode}")
+                if vma_stdout:
+                    self.logger.error(f"   VMA stdout: {vma_stdout[-200:]}")  # Последние 200 символов
+                if vma_stderr:
+                    self.logger.error(f"   VMA stderr: {vma_stderr[-200:]}")
+                if zstd_stderr:
+                    self.logger.error(f"   ZSTD stderr: {zstd_stderr[-200:]}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"❌ Исключение при распаковке: {e}")
+            return False
+    
+    def extract_vma_regular(self, vma_file: Path, output_dir: Path) -> bool:
+        """
+        Распаковка обычного VMA файла
+        
+        Args:
+            vma_file: Путь к .vma файлу
+            output_dir: Директория для вывода
+            
+        Returns:
+            bool: True если успешно
+        """
+        if output_dir.exists():
+            self.logger.warning(f"⚠️  Директория {output_dir} уже существует")
+            response = input(f"   Перезаписать? (y/N): ").lower().strip()
+            if response == 'y':
+                shutil.rmtree(output_dir)
+            else:
+                self.logger.info(f"   ⏭️  Пропуск")
+                return False
+        
+        self.logger.info(f"🔄 Извлечение VMA: {vma_file.name}")
+        
         cmd = [self.vma_path, "extract", "-v", str(vma_file), str(output_dir)]
         
-        self.logger.debug(f"Выполняю команду: {' '.join(cmd)}")
+        self.logger.debug(f"Выполняю: {' '.join(cmd)}")
         
         try:
             result = subprocess.run(cmd, capture_output=True, text=True)
             
             if result.returncode == 0:
+                self.logger.info(f"✅ Успешно распакован: {vma_file.name}")
                 return True
             else:
-                self.logger.error(f"  Ошибка VMA:")
-                self.logger.error(f"  Команда: {' '.join(cmd)}")
-                self.logger.error(f"  Код возврата: {result.returncode}")
-                if result.stdout:
-                    self.logger.error(f"  STDOUT: {result.stdout}")
+                self.logger.error(f"❌ Ошибка VMA:")
+                self.logger.error(f"   Код возврата: {result.returncode}")
                 if result.stderr:
-                    self.logger.error(f"  STDERR: {result.stderr}")
+                    self.logger.error(f"   STDERR: {result.stderr[-200:]}")
                 return False
                 
         except Exception as e:
-            self.logger.error(f"  Исключение при распаковке VMA: {e}")
+            self.logger.error(f"❌ Исключение: {e}")
             return False
     
-    def process_file(self, vma_file: Path, output_subdir: Path, parent_output: Path) -> bool:
+    def process_file(self, vma_file: Path, output_subdir: Path) -> bool:
         """
-        Обработка одного файла (vma или vma.zst)
+        Обработка одного файла
         
-        Args:
-            vma_file: Путь к файлу
-            output_subdir: Директория для результатов VMA
-            parent_output: Родительская output директория для временных файлов
-            
         Returns:
             bool: True если успешно
         """
-        temp_vma = None
-        success = False
-        
-        try:
-            if self.is_zst_compressed(vma_file):
-                # Распаковываем ZST в output директорию
-                temp_vma = self.decompress_zst(vma_file, parent_output)
-                if not temp_vma:
-                    return False
-                file_to_extract = temp_vma
-            else:
-                # Обычный VMA файл
-                file_to_extract = vma_file
-            
-            # Распаковываем VMA
-            self.logger.info(f"🔄 Извлечение VMA: {file_to_extract.name}")
-            success = self.extract_vma(file_to_extract, output_subdir)
-            
-            return success
-            
-        finally:
-            # Очистка временных файлов
-            if temp_vma and not self.keep_temp:
-                try:
-                    temp_vma.unlink()
-                    self.logger.debug(f"Удален временный файл: {temp_vma}")
-                except:
-                    pass
-            elif temp_vma and self.keep_temp:
-                # Переименовываем временный файл в нормальное имя
-                final_vma = parent_output / temp_vma.name.lstrip('.')
-                try:
-                    temp_vma.rename(final_vma)
-                    self.logger.info(f"📁 Временный VMA сохранен: {final_vma.name}")
-                except:
-                    pass
+        if self.is_zst_compressed(vma_file):
+            # Для .zst файлов используем pipe
+            return self.extract_vma_zst(vma_file, output_subdir)
+        else:
+            # Для обычных .vma файлов используем прямую распаковку
+            return self.extract_vma_regular(vma_file, output_subdir)
     
     def extract_all(self):
         """Основной метод для распаковки всех файлов"""
@@ -353,7 +337,7 @@ class VMAExtractor:
             self.logger.info(f"{'─' * 70}")
             
             # Обработка файла
-            if self.process_file(vma_file, output_subdir, self.output_dir):
+            if self.process_file(vma_file, output_subdir):
                 file_elapsed_time = time.time() - file_start_time
                 successful += 1
                 self.logger.info(f"✅ Успешно обработан: {file_name}")
@@ -424,7 +408,7 @@ class VMAExtractor:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Пакетная распаковка VMA/VMA.ZST файлов',
+        description='Пакетная распаковка VMA/VMA.ZST файлов (напрямую через pipe)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры использования:
@@ -433,9 +417,6 @@ def main():
   
   # С указанием путей к утилитам
   python3 vma_extractor.py -i /backup -o /restore --vma-path ./vma --zstd-path /usr/bin/zstd
-  
-  # С сохранением временных файлов
-  python3 vma_extractor.py -i /backup -o /restore --keep-temp
   
   # С логированием
   python3 vma_extractor.py -i /backup -o /restore -l extract.log
@@ -452,8 +433,6 @@ def main():
                        help='Путь к утилите zstd (по умолчанию: /usr/bin/zstd)')
     parser.add_argument('-l', '--log',
                        help='Путь к файлу лога')
-    parser.add_argument('--keep-temp', action='store_true',
-                       help='Сохранять временные .vma файлы')
     
     args = parser.parse_args()
     
@@ -463,7 +442,6 @@ def main():
             output_dir=args.output,
             vma_path=args.vma_path,
             zstd_path=args.zstd_path,
-            keep_temp=args.keep_temp,
             log_file=args.log
         )
         
